@@ -1,0 +1,8 @@
+some exercises for this stage of the code:
+
+1. Try to use epoll instead of poll in the event loop. This should be easy.
+2. We are using memmove to reclaim read buffer space. However, memmove on 
+   every request is unnecessary, change the code the perform memmove only before read.
+3. In the state_res function, write was performed for a single response. In pipelined 
+   sceneries, we could buffer multiple responses and flush them in the end with a single
+   write call. Note that the write buffer could be full in the middle.
