@@ -10,34 +10,27 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <string>
 #include <vector>
+// proj
+#include "hashtable.h"
 
-/* the changes we made in 1bd850 are to deal with multiple synchronous connections
-//  how??
-  1. we use an event loop that polls all the fds, and then the poll returns the ones that are ready to work on at that
-     moment,
-  2. then given the ready to use fds we perform the necessary sys calls in a non blocking mode to allow for
-     read and write buffers to be filled with new request data while processing the active fds
-  3. when a read or write fails in blocking mode, the fd is blocked off completely, but while in nonblocking mode a
-     failed read returns an error that tells us we need to try again when the poll tells us we're ready
-  4.
+#define container_of(ptr, type, member) ({                  \
+    const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+    (type *)( (char *)__mptr - offsetof(type, member) ); })
 
-  SYSCALL SUMMARY:
+// struct to define what type of information is being sent back
+enum
+{
+    SER_NIL = 0, // comparable to NULL
+    SER_ERR = 1, // err code + message
+    SER_STR = 2, // a string
+    SER_INT = 3, // 64-bit int
+    SER_ARR = 4, // Array
+};
 
-  - socket gives a file descriptor for a socket depending on given configureation
-  - setsockopt configures the socket from socket to a certain type of connection/addressing
-  - bind configures the address and port the socket will connect to
-  - listen() configures the socket to be passive and listen for requests/data at the address:port set
-    bind
-  - accept tells the system to accept an incoming connection at the socket
-  - write() writes data from a buffer to a file descriptor, so if our socket which is repped by fd
-    accepts a connection, a write() syscall to that fd will write a response to the computer/location
-    that connected to our fd
-  - read() reads data from fd into a buffer
-
-*/
-
-static void msg(const char *msg)
+static void
+msg(const char *msg)
 {
     fprintf(stderr, "%s\n", msg);
 }
@@ -71,7 +64,6 @@ static void fd_set_nb(int fd)
 
 const size_t k_max_msg = 4096;
 
-// constants to keep track of the state of the connection
 enum
 {
     STATE_REQ = 0,
@@ -79,7 +71,6 @@ enum
     STATE_END = 2, // mark the connection for deletion
 };
 
-// struct to define our connection
 struct Conn
 {
     int fd = -1;
@@ -93,7 +84,6 @@ struct Conn
     uint8_t wbuf[4 + k_max_msg];
 };
 
-// function to resize our connection fds vector, similar thing to when we exceed the threshold of a hashmap
 static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn)
 {
     if (fd2conn.size() <= (size_t)conn->fd)
@@ -103,7 +93,6 @@ static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn)
     fd2conn[conn->fd] = conn;
 }
 
-// function to accept a new connection to add to the fd2conn vector
 static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd)
 {
     // accept
@@ -137,6 +126,187 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd)
 static void state_req(Conn *conn);
 static void state_res(Conn *conn);
 
+const size_t k_max_args = 1024;
+
+static int32_t parse_req(
+    const uint8_t *data, size_t len, std::vector<std::string> &out)
+{
+    if (len < 4)
+    {
+        return -1;
+    }
+    uint32_t n = 0;
+    memcpy(&n, &data[0], 4);
+    if (n > k_max_args)
+    {
+        return -1;
+    }
+
+    size_t pos = 4;
+    while (n--)
+    {
+        if (pos + 4 > len)
+        {
+            return -1;
+        }
+        uint32_t sz = 0;
+        memcpy(&sz, &data[pos], 4);
+        if (pos + 4 + sz > len)
+        {
+            return -1;
+        }
+        out.push_back(std::string((char *)&data[pos + 4], sz));
+        pos += 4 + sz;
+    }
+
+    if (pos != len)
+    {
+        return -1; // trailing garbage
+    }
+    return 0;
+}
+
+enum
+{
+    RES_OK = 0,
+    RES_ERR = 1,
+    RES_NX = 2,
+};
+
+// The data structure for the key space.
+static struct
+{
+    HMap db;
+} g_data;
+
+// the structure for the key
+struct Entry
+{
+    struct HNode node;
+    std::string key;
+    std::string val;
+};
+
+static bool entry_eq(HNode *lhs, HNode *rhs)
+{
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return le->key == re->key;
+}
+
+static uint64_t str_hash(const uint8_t *data, size_t len)
+{
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++)
+    {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static uint32_t do_get(
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+{
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node)
+    {
+        return RES_NX;
+    }
+
+    const std::string &val = container_of(node, Entry, node)->val;
+    assert(val.size() <= k_max_msg);
+    memcpy(res, val.data(), val.size());
+    *reslen = (uint32_t)val.size();
+    return RES_OK;
+}
+
+static uint32_t do_set(
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+{
+    (void)res;
+    (void)reslen;
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node)
+    {
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    }
+    else
+    {
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+    return RES_OK;
+}
+
+static uint32_t do_del(
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+{
+    (void)res;
+    (void)reslen;
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);
+    if (node)
+    {
+        delete container_of(node, Entry, node);
+    }
+    return RES_OK;
+}
+
+static bool cmd_is(const std::string &word, const char *cmd)
+{
+    return 0 == strcasecmp(word.c_str(), cmd);
+}
+
+static int32_t do_request(
+    const uint8_t *req, uint32_t reqlen,
+    uint32_t *rescode, uint8_t *res, uint32_t *reslen)
+{
+    std::vector<std::string> cmd;
+    if (0 != parse_req(req, reqlen, cmd))
+    {
+        msg("bad req");
+        return -1;
+    }
+    if (cmd.size() == 2 && cmd_is(cmd[0], "get"))
+    {
+        *rescode = do_get(cmd, res, reslen);
+    }
+    else if (cmd.size() == 3 && cmd_is(cmd[0], "set"))
+    {
+        *rescode = do_set(cmd, res, reslen);
+    }
+    else if (cmd.size() == 2 && cmd_is(cmd[0], "del"))
+    {
+        *rescode = do_del(cmd, res, reslen);
+    }
+    else
+    {
+        // cmd is not recognized
+        *rescode = RES_ERR;
+        const char *msg = "Unknown cmd";
+        strcpy((char *)res, msg);
+        *reslen = strlen(msg);
+        return 0;
+    }
+    return 0;
+}
+
 static bool try_one_request(Conn *conn)
 {
     // try to parse a request from the buffer
@@ -145,9 +315,6 @@ static bool try_one_request(Conn *conn)
         // not enough data in the buffer. Will retry in the next iteration
         return false;
     }
-
-    // read the first 4 bytes of whatever has been loaded into the connection's read buffer for the length
-    // of the message, if too long return an error
     uint32_t len = 0;
     memcpy(&len, &conn->rbuf[0], 4);
     if (len > k_max_msg)
@@ -162,13 +329,21 @@ static bool try_one_request(Conn *conn)
         return false;
     }
 
-    // got one request, do something with it
-    printf("client says: %.*s\n", len, &conn->rbuf[4]);
-
-    // generating echoing response
-    memcpy(&conn->wbuf[0], &len, 4);
-    memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
-    conn->wbuf_size = 4 + len;
+    // got one request, generate the response.
+    uint32_t rescode = 0;
+    uint32_t wlen = 0;
+    int32_t err = do_request(
+        &conn->rbuf[4], len,
+        &rescode, &conn->wbuf[4 + 4], &wlen);
+    if (err)
+    {
+        conn->state = STATE_END;
+        return false;
+    }
+    wlen += 4;
+    memcpy(&conn->wbuf[0], &wlen, 4);
+    memcpy(&conn->wbuf[4], &rescode, 4);
+    conn->wbuf_size = 4 + wlen;
 
     // remove the request from the buffer.
     // note: frequent memmove is inefficient.
@@ -197,9 +372,7 @@ static bool try_fill_buffer(Conn *conn)
     {
         size_t cap = sizeof(conn->rbuf) - conn->rbuf_size;
         rv = read(conn->fd, &conn->rbuf[conn->rbuf_size], cap);
-    } while (rv < 0 && errno == EINTR); // the loop serves the same purpose as the one in try_flush_buffer
-
-    // code till line 224 does similar stuff as in try_flush_buffer
+    } while (rv < 0 && errno == EINTR);
     if (rv < 0 && errno == EAGAIN)
     {
         // got EAGAIN, stop.
@@ -230,15 +403,12 @@ static bool try_fill_buffer(Conn *conn)
 
     // Try to process requests one by one.
     // Why is there a loop? Please read the explanation of "pipelining".
-    // we run the try_one_request to process one request at a time until there are no more requests left in the
-    // read buffer, this needs to be done because multiple requests can be sent from the client at once
     while (try_one_request(conn))
     {
     }
     return (conn->state == STATE_REQ);
 }
 
-// if our connection is in a request state we want to fill up our read buffer till completion
 static void state_req(Conn *conn)
 {
     while (try_fill_buffer(conn))
@@ -246,37 +416,27 @@ static void state_req(Conn *conn)
     }
 }
 
-// notes in state_res and try_flush_buffer explain the functioning of try_flush_buffer
 static bool try_flush_buffer(Conn *conn)
 {
     ssize_t rv = 0;
-
-    // try to write data from the write buffer till we get a successful write or some error not EINTR
     do
     {
         size_t remain = conn->wbuf_size - conn->wbuf_sent;
         rv = write(conn->fd, &conn->wbuf[conn->wbuf_sent], remain);
     } while (rv < 0 && errno == EINTR);
-
     if (rv < 0 && errno == EAGAIN)
     {
         // got EAGAIN, stop.
         return false;
     }
-
     if (rv < 0)
     {
         msg("write() error");
         conn->state = STATE_END;
         return false;
     }
-
-    // increase the size of data sent from the write buffer by whatever was returned by rv
     conn->wbuf_sent += (size_t)rv;
-
     assert(conn->wbuf_sent <= conn->wbuf_size);
-
-    // check that we have completely written from the write buffer
     if (conn->wbuf_sent == conn->wbuf_size)
     {
         // response was fully sent, change state back
@@ -289,16 +449,13 @@ static bool try_flush_buffer(Conn *conn)
     return true;
 }
 
-// function to handle a connection when it is in its response state
 static void state_res(Conn *conn)
 {
-    // flushes the buffer till it is empty
     while (try_flush_buffer(conn))
     {
     }
 }
 
-// function that proccesses the connection based on the state of its connection,
 static void connection_io(Conn *conn)
 {
     if (conn->state == STATE_REQ)
@@ -317,18 +474,16 @@ static void connection_io(Conn *conn)
 
 int main()
 {
-    // get the fd number for the point in the machine that will be used to listen to requests
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
     {
         die("socket()");
     }
 
-    // configure the socket for tcp connections
     int val = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
-    // bind the socket to an address and port 1234
+    // bind
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = ntohs(1234);
@@ -339,7 +494,7 @@ int main()
         die("bind()");
     }
 
-    // mark the socket procured by the socket() syscall to listen for data
+    // listen
     rv = listen(fd, SOMAXCONN);
     if (rv)
     {
@@ -352,8 +507,8 @@ int main()
     // set the listen fd to nonblocking mode
     fd_set_nb(fd);
 
-    // the event loo
-    std::vector<struct pollfd> poll_args; // this array keeps track of the fds that will be polled for their status
+    // the event loop
+    std::vector<struct pollfd> poll_args;
     while (true)
     {
         // prepare the arguments of the poll()
@@ -371,8 +526,6 @@ int main()
             struct pollfd pfd = {};
             pfd.fd = conn->fd;
             pfd.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
-            // checks the state of the connection, if it is in the request state, the respective fd is for reading from
-            // else it is written from
             pfd.events = pfd.events | POLLERR;
             poll_args.push_back(pfd);
         }
